@@ -1,5 +1,9 @@
 # Allow IP Request Plugin
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/CAJIO/allowiprequest)](https://goreportcard.com/report/github.com/CAJIO/allowiprequest)
+[![CodeQL](https://github.com/CAJIO/allowiprequest/actions/workflows/codeql.yml/badge.svg)](https://github.com/CAJIO/allowiprequest/actions/workflows/codeql.yml)
+
+
 This is a **Traefik middleware plugin** that implements a dynamic IP whitelisting mechanism. It protects your services by blocking all requests by default while allowing users to self-whitelist their IP address by visiting a specific "knock" URL.
 
 ## Features
