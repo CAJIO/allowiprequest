@@ -26,8 +26,16 @@ To use this plugin, you must configure it in your Traefik dynamic configuration.
 | `whitelistDuration` | `string` | `"24h"` | How long the IP remains whitelisted (e.g., "1h", "30m"). |
 | `allowedSubnets` | `[]string` | `["192.168.0.0/16", ...]` | List of CIDR ranges that bypass the knock check and can view the admin page. |
 
-### Example Middleware Configuration
+### Add the plugin to Traefik
+```yaml
+experimental:
+  plugins:
+    allowiprequest:
+      moduleName: github.com/CAJIO/allowiprequest
+      version: v1.0.0
+```
 
+### Middleware Configuration
 ```yaml
 http:
   middlewares:
@@ -39,6 +47,16 @@ http:
           allowedSubnets:
             - "127.0.0.1/32"
             - "192.168.1.0/24"
+```
+
+### Router Configuration
+```yaml
+http:
+  routers:
+    mydomain:
+      rule: "Host(`example.com`)"
+      middlewares:
+        - my-ip-allowlist
 ```
 
 ## How It Works
