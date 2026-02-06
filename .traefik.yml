@@ -1,0 +1,15 @@
+displayName: AllowIPRequest
+type: middleware
+iconPath: .assets/icon.png
+
+import: github.com/CAJIO/allowiprequest
+
+summary: '[CAJIO] Allow IP Request on request path /knock-knock'
+
+testData:
+  KnockURL: "/knock-knock"
+  WhitelistDuration: "5s"
+  AllowedSubnets:
+    - "192.168.0.0/16"
+    - "10.0.0.0/8"
+    - "127.0.0.0/8"
