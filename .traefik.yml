@@ -4,7 +4,7 @@ iconPath: .assets/icon.png
 
 import: github.com/CAJIO/allowiprequest
 
-summary: '[CAJIO] Allow IP Request on request path /knock-knock'
+summary: 'Its plugin that allows you to whitelist your ip address by visiting a secret URL. It protects your services by blocking all requests by default while allowing users to self-whitelist their IP address by visiting a secret URL.'
 
 testData:
   KnockURL: "/knock-knock"
@@ -13,3 +13,5 @@ testData:
     - "192.168.0.0/16"
     - "10.0.0.0/8"
     - "127.0.0.0/8"
+  SyncAllowlist: true
+  AllowlistFile: "/etc/traefik/conf.d/allowlist.yml"

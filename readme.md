@@ -25,6 +25,8 @@ To use this plugin, you must configure it in your Traefik dynamic configuration.
 | `knockUrl` | `string` | `"/knock-knock"` | The specific URL path users must visit to whitelist their IP. |
 | `whitelistDuration` | `string` | `"24h"` | How long the IP remains whitelisted (e.g., "1h", "30m"). |
 | `allowedSubnets` | `[]string` | `["192.168.0.0/16", ...]` | List of CIDR ranges that bypass the knock check and can view the admin page. |
+| `syncAllowlist` | `bool` | `false` | Enable writing the current allowlist to a YAML file for use as a Traefik TCP middleware. |
+| `allowlistFile` | `string` | `""` | Path to the YAML file (required when `syncAllowlist` is `true`). |
 
 ### Add the plugin to Traefik
 ```yaml
@@ -47,6 +49,61 @@ http:
           allowedSubnets:
             - "127.0.0.1/32"
             - "192.168.1.0/24"
+```
+
+### TCP Allowlist Sync
+
+The plugin can write a YAML file that Traefik's [file provider](https://doc.traefik.io/traefik/providers/file/) picks up as a TCP `IPAllowList` middleware. This lets you reuse the same dynamic allowlist for TCP routers (e.g. databases, mail servers) that don't support HTTP middleware plugins.
+
+Enable it by setting `syncAllowlist: true` and providing the output path:
+
+```yaml
+http:
+  middlewares:
+    my-ip-allowlist:
+      plugin:
+        allowiprequest:
+          knockUrl: "/knock-knock"
+          whitelistDuration: "24h"
+          allowedSubnets:
+            - "127.0.0.1/32"
+            - "192.168.1.0/24"
+          syncAllowlist: true
+          allowlistFile: "/etc/traefik/conf.d/allowlist.yml"
+```
+
+The generated file has the following structure and is updated atomically on every change (knock / expiry):
+
+```yaml
+tcp:
+  middlewares:
+    local-whitelist:
+      IPAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "192.168.1.0/24"
+          - "1.2.3.4/32"   # dynamically added via knock
+```
+
+To use it, configure Traefik's file provider to watch the output directory and reference the middleware in a TCP router:
+
+```yaml
+# traefik.yml (static config)
+providers:
+  file:
+    directory: /etc/traefik/conf.d
+    watch: true
+```
+
+```yaml
+# TCP router example
+tcp:
+  routers:
+    my-tcp-service:
+      rule: "HostSNI(`*`)"
+      middlewares:
+        - local-whitelist
+      service: my-tcp-backend
 ```
 
 ### Router Configuration

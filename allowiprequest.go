@@ -3,11 +3,13 @@ package allowiprequest
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
 )
 
@@ -15,6 +17,8 @@ type Config struct {
 	KnockURL          string   `json:"knockUrl,omitempty"`
 	WhitelistDuration string   `json:"whitelistDuration,omitempty"`
 	AllowedSubnets    []string `json:"allowedSubnets,omitempty"`
+	SyncAllowlist     bool     `json:"syncAllowlist,omitempty"`
+	AllowlistFile     string   `json:"allowlistFile,omitempty"`
 }
 
 func CreateConfig() *Config {
@@ -25,12 +29,15 @@ func CreateConfig() *Config {
 	}
 }
 
-type Demo struct {
+type AllowIpR struct {
 	next              http.Handler
 	name              string
 	knockURL          string
 	whitelistDuration time.Duration
 	allowedIPNets     []*net.IPNet
+	allowedSubnets    []string
+	syncAllowlist     bool
+	allowlistFile     string
 	whitelist         map[string]time.Time
 	mu                sync.RWMutex
 }
@@ -54,17 +61,30 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		allowedIPNets = append(allowedIPNets, ipNet)
 	}
 
-	return &Demo{
+	d := &AllowIpR{
 		next:              next,
 		name:              name,
 		knockURL:          config.KnockURL,
 		whitelistDuration: duration,
 		allowedIPNets:     allowedIPNets,
+		allowedSubnets:    config.AllowedSubnets,
+		syncAllowlist:     config.SyncAllowlist,
+		allowlistFile:     config.AllowlistFile,
 		whitelist:         make(map[string]time.Time),
-	}, nil
+	}
+
+	if d.syncAllowlist {
+		if d.allowlistFile == "" {
+			return nil, fmt.Errorf("allowlistFile must be set when syncAllowlist is enabled")
+		}
+		log.Printf("[allowiprequest] allowlist sync enabled, file: %s", d.allowlistFile)
+		d.writeAllowlist()
+	}
+
+	return d, nil
 }
 
-func (a *Demo) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+func (a *AllowIpR) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Extract IP (without port)
 	host, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {
@@ -98,6 +118,9 @@ func (a *Demo) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		a.mu.Lock()
 		a.whitelist[host] = time.Now().Add(a.whitelistDuration)
 		a.mu.Unlock()
+		if a.syncAllowlist {
+			a.writeAllowlist()
+		}
 		a.serveSuccessPage(rw, host)
 		return
 	}
@@ -122,6 +145,9 @@ func (a *Demo) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			a.mu.Lock()
 			delete(a.whitelist, host)
 			a.mu.Unlock()
+			if a.allowlistFile != "" {
+				a.writeAllowlist()
+			}
 		}
 	}
 
@@ -129,7 +155,7 @@ func (a *Demo) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	http.Error(rw, "Forbidden", http.StatusForbidden)
 }
 
-func (a *Demo) serveSuccessPage(rw http.ResponseWriter, ip string) {
+func (a *AllowIpR) serveSuccessPage(rw http.ResponseWriter, ip string) {
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 	rw.WriteHeader(http.StatusOK)
 	html := fmt.Sprintf(`
@@ -157,7 +183,7 @@ func (a *Demo) serveSuccessPage(rw http.ResponseWriter, ip string) {
 	rw.Write([]byte(html))
 }
 
-func (a *Demo) serveAdminPage(rw http.ResponseWriter) {
+func (a *AllowIpR) serveAdminPage(rw http.ResponseWriter) {
 	a.mu.RLock()
 	// Copy whitelist to avoid holding lock while rendering
 	ips := make(map[string]time.Time, len(a.whitelist))
@@ -216,4 +242,67 @@ func (a *Demo) serveAdminPage(rw http.ResponseWriter) {
 </html>`, rows.String())
 
 	rw.Write([]byte(html))
+}
+
+func (a *AllowIpR) writeAllowlist() {
+	var sb strings.Builder
+	sb.WriteString("tcp:\n")
+	sb.WriteString("  middlewares:\n")
+	sb.WriteString("    local-whitelist:\n")
+	sb.WriteString("      IPAllowList:\n")
+	sb.WriteString("        sourceRange:\n")
+
+	for _, subnet := range a.allowedSubnets {
+		sb.WriteString(fmt.Sprintf("          - \"%s\"\n", subnet))
+	}
+
+	now := time.Now()
+	a.mu.RLock()
+	for ip, expiry := range a.whitelist {
+		if now.Before(expiry) {
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				continue
+			}
+			if parsed.To4() != nil {
+				sb.WriteString(fmt.Sprintf("          - \"%s/32\"\n", ip))
+			} else {
+				sb.WriteString(fmt.Sprintf("          - \"%s/128\"\n", ip))
+			}
+		}
+	}
+	a.mu.RUnlock()
+
+	dir := filepath.Dir(a.allowlistFile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[allowiprequest] failed to create directory %s: %v", dir, err)
+		return
+	}
+
+	tmp, err := os.CreateTemp(dir, ".allowlist-*.yml.tmp")
+	if err != nil {
+		log.Printf("[allowiprequest] failed to create temp file in %s: %v", dir, err)
+		return
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.WriteString(sb.String()); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		log.Printf("[allowiprequest] failed to write temp file: %v", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[allowiprequest] failed to close temp file: %v", err)
+		return
+	}
+
+	if err := os.Rename(tmpName, a.allowlistFile); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[allowiprequest] failed to rename %s -> %s: %v", tmpName, a.allowlistFile, err)
+		return
+	}
+
+	log.Printf("[allowiprequest] allowlist written to %s", a.allowlistFile)
 }
