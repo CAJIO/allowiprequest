@@ -203,7 +203,7 @@ func (a *AllowIpR) serveAdminPage(rw http.ResponseWriter) {
 		if now.After(expiry) {
 			status = "Expired"
 		}
-		rows.WriteString(fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%s</td></tr>", ip, expiry.Format(time.RFC3339), status))
+		rows.WriteString(fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%s</td></tr>", ip, expiry.Format("02 Jan 2006 15:04:05"), status))
 	}
 
 	html := fmt.Sprintf(`
