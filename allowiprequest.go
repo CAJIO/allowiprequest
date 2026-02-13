@@ -2,6 +2,7 @@ package allowiprequest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -17,8 +18,8 @@ type Config struct {
 	KnockURL          string   `json:"knockUrl,omitempty"`
 	WhitelistDuration string   `json:"whitelistDuration,omitempty"`
 	AllowedSubnets    []string `json:"allowedSubnets,omitempty"`
-	SyncAllowlist     bool     `json:"syncAllowlist,omitempty"`
 	AllowlistFile     string   `json:"allowlistFile,omitempty"`
+	PersistFile       string   `json:"persistFile,omitempty"`
 }
 
 func CreateConfig() *Config {
@@ -36,8 +37,8 @@ type AllowIpR struct {
 	whitelistDuration time.Duration
 	allowedIPNets     []*net.IPNet
 	allowedSubnets    []string
-	syncAllowlist     bool
 	allowlistFile     string
+	persistFile       string
 	whitelist         map[string]time.Time
 	mu                sync.RWMutex
 }
@@ -68,16 +69,17 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		whitelistDuration: duration,
 		allowedIPNets:     allowedIPNets,
 		allowedSubnets:    config.AllowedSubnets,
-		syncAllowlist:     config.SyncAllowlist,
 		allowlistFile:     config.AllowlistFile,
+		persistFile:       config.PersistFile,
 		whitelist:         make(map[string]time.Time),
 	}
 
-	if d.syncAllowlist {
-		if d.allowlistFile == "" {
-			return nil, fmt.Errorf("allowlistFile must be set when syncAllowlist is enabled")
-		}
-		log.Printf("[allowiprequest] allowlist sync enabled, file: %s", d.allowlistFile)
+	if d.persistFile != "" {
+		d.loadWhitelist()
+	}
+
+	if d.allowlistFile != "" {
+		log.Printf("[allowiprequest] allowlist file: %s", d.allowlistFile)
 		d.writeAllowlist()
 	}
 
@@ -118,8 +120,11 @@ func (a *AllowIpR) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		a.mu.Lock()
 		a.whitelist[host] = time.Now().Add(a.whitelistDuration)
 		a.mu.Unlock()
-		if a.syncAllowlist {
+		if a.allowlistFile != "" {
 			a.writeAllowlist()
+		}
+		if a.persistFile != "" {
+			a.persistWhitelist()
 		}
 		a.serveSuccessPage(rw, host)
 		return
@@ -131,28 +136,7 @@ func (a *AllowIpR) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// 4. Check Dynamic Whitelist
-	a.mu.RLock()
-	expiry, exists := a.whitelist[host]
-	a.mu.RUnlock()
-
-	if exists {
-		if time.Now().Before(expiry) {
-			a.next.ServeHTTP(rw, req)
-			return
-		} else {
-			// Clean up expired entry
-			a.mu.Lock()
-			delete(a.whitelist, host)
-			a.mu.Unlock()
-			if a.allowlistFile != "" {
-				a.writeAllowlist()
-			}
-		}
-	}
-
-	// Block by default
-	http.Error(rw, "Forbidden", http.StatusForbidden)
+	a.next.ServeHTTP(rw, req)
 }
 
 func (a *AllowIpR) serveSuccessPage(rw http.ResponseWriter, ip string) {
@@ -245,15 +229,10 @@ func (a *AllowIpR) serveAdminPage(rw http.ResponseWriter) {
 }
 
 func (a *AllowIpR) writeAllowlist() {
-	var sb strings.Builder
-	sb.WriteString("tcp:\n")
-	sb.WriteString("  middlewares:\n")
-	sb.WriteString("    local-whitelist:\n")
-	sb.WriteString("      IPAllowList:\n")
-	sb.WriteString("        sourceRange:\n")
-
+	// Build the sourceRange entries shared by both tcp and http blocks
+	var ranges strings.Builder
 	for _, subnet := range a.allowedSubnets {
-		sb.WriteString(fmt.Sprintf("          - \"%s\"\n", subnet))
+		ranges.WriteString(fmt.Sprintf("          - \"%s\"\n", subnet))
 	}
 
 	now := time.Now()
@@ -265,13 +244,30 @@ func (a *AllowIpR) writeAllowlist() {
 				continue
 			}
 			if parsed.To4() != nil {
-				sb.WriteString(fmt.Sprintf("          - \"%s/32\"\n", ip))
+				ranges.WriteString(fmt.Sprintf("          - \"%s/32\"\n", ip))
 			} else {
-				sb.WriteString(fmt.Sprintf("          - \"%s/128\"\n", ip))
+				ranges.WriteString(fmt.Sprintf("          - \"%s/128\"\n", ip))
 			}
 		}
 	}
 	a.mu.RUnlock()
+
+	rangeStr := ranges.String()
+
+	var sb strings.Builder
+	sb.WriteString("http:\n")
+	sb.WriteString("  middlewares:\n")
+	sb.WriteString("    local-whitelist-http:\n")
+	sb.WriteString("      IPAllowList:\n")
+	sb.WriteString("        sourceRange:\n")
+	sb.WriteString(rangeStr)
+	sb.WriteString("\n")
+	sb.WriteString("tcp:\n")
+	sb.WriteString("  middlewares:\n")
+	sb.WriteString("    local-whitelist-tcp:\n")
+	sb.WriteString("      IPAllowList:\n")
+	sb.WriteString("        sourceRange:\n")
+	sb.WriteString(rangeStr)
 
 	dir := filepath.Dir(a.allowlistFile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -305,4 +301,90 @@ func (a *AllowIpR) writeAllowlist() {
 	}
 
 	log.Printf("[allowiprequest] allowlist written to %s", a.allowlistFile)
+}
+
+type persistEntry struct {
+	IP     string    `json:"ip"`
+	Expiry time.Time `json:"expiry"`
+}
+
+func (a *AllowIpR) persistWhitelist() {
+	now := time.Now()
+	var entries []persistEntry
+
+	a.mu.RLock()
+	for ip, expiry := range a.whitelist {
+		if now.Before(expiry) {
+			entries = append(entries, persistEntry{IP: ip, Expiry: expiry})
+		}
+	}
+	a.mu.RUnlock()
+
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		log.Printf("[allowiprequest] failed to marshal whitelist: %v", err)
+		return
+	}
+
+	dir := filepath.Dir(a.persistFile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[allowiprequest] failed to create directory %s: %v", dir, err)
+		return
+	}
+
+	tmp, err := os.CreateTemp(dir, ".persist-*.json.tmp")
+	if err != nil {
+		log.Printf("[allowiprequest] failed to create temp file in %s: %v", dir, err)
+		return
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		log.Printf("[allowiprequest] failed to write persist temp file: %v", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[allowiprequest] failed to close persist temp file: %v", err)
+		return
+	}
+
+	if err := os.Rename(tmpName, a.persistFile); err != nil {
+		os.Remove(tmpName)
+		log.Printf("[allowiprequest] failed to rename %s -> %s: %v", tmpName, a.persistFile, err)
+		return
+	}
+
+	log.Printf("[allowiprequest] whitelist persisted to %s", a.persistFile)
+}
+
+func (a *AllowIpR) loadWhitelist() {
+	data, err := os.ReadFile(a.persistFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("[allowiprequest] no persist file found at %s, starting fresh", a.persistFile)
+			return
+		}
+		log.Printf("[allowiprequest] failed to read persist file %s: %v", a.persistFile, err)
+		return
+	}
+
+	var entries []persistEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("[allowiprequest] failed to parse persist file %s: %v", a.persistFile, err)
+		return
+	}
+
+	now := time.Now()
+	restored := 0
+	for _, e := range entries {
+		if now.Before(e.Expiry) {
+			a.whitelist[e.IP] = e.Expiry
+			restored++
+		}
+	}
+
+	log.Printf("[allowiprequest] restored %d IPs from %s", restored, a.persistFile)
 }
