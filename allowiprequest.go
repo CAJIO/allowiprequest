@@ -41,6 +41,7 @@ type AllowIpR struct {
 	persistFile       string
 	whitelist         map[string]time.Time
 	mu                sync.RWMutex
+	cancel            context.CancelFunc
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
@@ -62,6 +63,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		allowedIPNets = append(allowedIPNets, ipNet)
 	}
 
+	cleanupCtx, cancel := context.WithCancel(ctx)
+
 	d := &AllowIpR{
 		next:              next,
 		name:              name,
@@ -72,6 +75,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		allowlistFile:     config.AllowlistFile,
 		persistFile:       config.PersistFile,
 		whitelist:         make(map[string]time.Time),
+		cancel:            cancel,
 	}
 
 	if d.persistFile != "" {
@@ -82,6 +86,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		log.Printf("[allowiprequest] allowlist file: %s", d.allowlistFile)
 		d.writeAllowlist()
 	}
+
+	go d.cleanupLoop(cleanupCtx)
 
 	return d, nil
 }
@@ -358,6 +364,47 @@ func (a *AllowIpR) persistWhitelist() {
 	}
 
 	log.Printf("[allowiprequest] whitelist persisted to %s", a.persistFile)
+}
+
+func (a *AllowIpR) cleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.cleanupExpired()
+		}
+	}
+}
+
+func (a *AllowIpR) cleanupExpired() {
+	now := time.Now()
+	removed := 0
+
+	a.mu.Lock()
+	for ip, expiry := range a.whitelist {
+		if now.After(expiry) {
+			delete(a.whitelist, ip)
+			removed++
+		}
+	}
+	a.mu.Unlock()
+
+	if removed == 0 {
+		return
+	}
+
+	log.Printf("[allowiprequest] cleaned up %d expired IPs", removed)
+
+	if a.allowlistFile != "" {
+		a.writeAllowlist()
+	}
+	if a.persistFile != "" {
+		a.persistWhitelist()
+	}
 }
 
 func (a *AllowIpR) loadWhitelist() {
