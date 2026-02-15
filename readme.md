@@ -33,7 +33,7 @@ experimental:
   plugins:
     allowiprequest:
       moduleName: github.com/CAJIO/allowiprequest
-      version: v1.2.0
+      version: v1.2.1
 ```
 
 ### Middleware Configuration
